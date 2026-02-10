@@ -532,6 +532,8 @@ async def handle_chat_message(user_id: str, data: dict):
     timestamp = datetime.utcnow().isoformat() + "Z"
 
     # Confirm to sender first (so their message appears in UI immediately)
+    # Temporary delay to simulate slow ack timing for debugging.
+    await asyncio.sleep(2)
     await manager.send_json(user_id, {
         "type": "message_sent",
         "timestamp": timestamp
