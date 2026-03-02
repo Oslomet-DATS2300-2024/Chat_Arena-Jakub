@@ -109,7 +109,7 @@ async def pair_with_ai(user_id: str) -> bool:
         await pairing_service.remove_from_queue_atomic(user_id)
 
         # Update user session
-        manager.update_session(
+        await manager.update_session(
             user_id,
             paired=True,
             partner_id=ai_id,
@@ -119,7 +119,7 @@ async def pair_with_ai(user_id: str) -> bool:
         )
 
         # Set initial activity timestamp
-        manager.update_activity(user_id)
+        await manager.update_activity(user_id)
 
         # Create AI session record in websocket manager
         manager.create_ai_session(
@@ -185,12 +185,53 @@ async def delayed_pairing(user_id: str, delay_seconds: int):
                 await pair_with_ai(user_id)
 
 
+async def handle_partner_breakup(partner_id: str, session_id: Optional[str], is_ai_partner: bool, schedule_pairing: bool = True):
+    """Extract partner from current pairing. Used by reassign, disconnect, and inactivity handlers."""
+    global ai_manager
+
+    if is_ai_partner and ai_manager:
+        # Remove AI participant
+        await ai_manager.remove_ai_participant(partner_id)
+        manager.remove_ai_session(partner_id)
+    else:
+        # Clear partner's pairing atomically first
+        cleared_partner = await manager.clear_pairing_atomic(partner_id)
+
+        if cleared_partner is not None:
+            # Notify human partner
+            await manager.send_json(partner_id, {"type": "partner_left"})
+
+            # Add delay for partner if enabled
+            if ai_manager and ai_manager.pairing_delay_enabled:
+                pairing_service.add_delay(partner_id)
+
+            # Put partner back in queue (atomic)
+            position = await pairing_service.add_to_queue_atomic(partner_id)
+            await manager.send_json(partner_id, {
+                "type": "waiting",
+                "position": position
+            })
+
+            # Schedule delayed pairing for partner
+            if schedule_pairing:
+                if ai_manager and ai_manager.pairing_delay_enabled:
+                    asyncio.create_task(
+                        delayed_pairing(partner_id, ai_manager.reassign_delay_seconds)
+                    )
+                else:
+                    await try_pairing(partner_id)
+
+    # End conversation if exists
+    if session_id:
+        await storage_service.end_conversation(session_id)
+
+
 async def check_inactive_users():
     """Background task to check for and kick inactive users."""
     while True:
         await asyncio.sleep(60)  # Check every minute
 
-        inactive_users = manager.get_inactive_users(INACTIVITY_TIMEOUT_SECONDS)
+        inactive_users = await manager.get_inactive_users(INACTIVITY_TIMEOUT_SECONDS)
 
         for user_id in inactive_users:
             logger.info(f"Kicking inactive user: {user_id}")
@@ -199,8 +240,6 @@ async def check_inactive_users():
 
 async def handle_inactivity_kick(user_id: str):
     """Handle kicking a user due to inactivity."""
-    global ai_manager
-
     session = manager.get_session(user_id)
 
     if not session:
@@ -209,54 +248,20 @@ async def handle_inactivity_kick(user_id: str):
     # Notify the inactive user
     await manager.send_json(user_id, {"type": "inactivity_kick"})
 
-    if session.paired:
-        partner_id = session.partner_id
-        session_id = session.session_id
-        is_ai_partner = session.is_ai_partner
-
-        if partner_id:
-            # Handle AI partner differently
-            if is_ai_partner and ai_manager:
-                # Remove AI participant
-                await ai_manager.remove_ai_participant(partner_id)
-                manager.remove_ai_session(partner_id)
-            else:
-                # Clear partner's pairing atomically first
-                cleared_partner = await manager.clear_pairing_atomic(partner_id)
-
-                if cleared_partner is not None:
-                    # Notify human partner
-                    await manager.send_json(partner_id, {"type": "partner_left"})
-
-                    # Add delay for partner if enabled
-                    if ai_manager and ai_manager.pairing_delay_enabled:
-                        pairing_service.add_delay(partner_id)
-
-                    # Put partner back in queue (atomic)
-                    position = await pairing_service.add_to_queue_atomic(partner_id)
-                    await manager.send_json(partner_id, {
-                        "type": "waiting",
-                        "position": position
-                    })
-
-                    # Schedule delayed pairing for partner
-                    if ai_manager and ai_manager.pairing_delay_enabled:
-                        asyncio.create_task(
-                            delayed_pairing(partner_id, ai_manager.reassign_delay_seconds)
-                        )
-                    else:
-                        await try_pairing(partner_id)
-
-        # End conversation if exists
-        if session_id:
-            await storage_service.end_conversation(session_id)
+    if session.paired and session.partner_id:
+        # Use helper to clean up partner
+        await handle_partner_breakup(
+            partner_id=session.partner_id,
+            session_id=session.session_id,
+            is_ai_partner=session.is_ai_partner
+        )
 
     # Remove user from queue and clear their session (but don't fully disconnect)
     await pairing_service.remove_from_queue_atomic(user_id)
     pairing_service.remove_delay(user_id)
     await manager.clear_pairing_atomic(user_id)
     # Reset their consent status so they need to rejoin
-    manager.update_session(user_id, consented=False, last_activity=None)
+    await manager.update_session(user_id, consented=False, last_activity=None)
 
 
 @asynccontextmanager
@@ -330,20 +335,45 @@ async def get_consent():
 
 # ==================== WebSocket Handler ====================
 
+
+import time
+
+HEARTBEAT_INTERVAL = 10  # seconds
+HEARTBEAT_TIMEOUT = 30   # seconds
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    """Main WebSocket endpoint for chat functionality."""
+    """Main WebSocket endpoint for chat functionality with heartbeat."""
     user_id = await manager.connect(websocket)
+    last_heartbeat = time.time()
+
+    async def heartbeat_monitor():
+        nonlocal last_heartbeat
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
+            if time.time() - last_heartbeat > HEARTBEAT_TIMEOUT:
+                await handle_disconnect(user_id)
+                await websocket.close()
+                break
+
+    monitor_task = asyncio.create_task(heartbeat_monitor())
 
     try:
         while True:
             data = await websocket.receive_json()
+            if data.get("type") == "ping":
+                # Respond to ping
+                await websocket.send_json({"type": "pong"})
+                last_heartbeat = time.time()
+                continue
             await handle_message(user_id, data)
     except WebSocketDisconnect:
         await handle_disconnect(user_id)
     except Exception as e:
         print(f"WebSocket error for {user_id}: {e}")
         await handle_disconnect(user_id)
+    finally:
+        monitor_task.cancel()
 
 
 async def handle_message(user_id: str, data: dict):
@@ -369,8 +399,8 @@ async def handle_join(user_id: str, data: dict):
         })
         return
 
-    manager.update_session(user_id, consented=True)
-    manager.update_activity(user_id)  # Track activity
+    await manager.update_session(user_id, consented=True)
+    await manager.update_activity(user_id)  # Track activity
 
     # Add to queue (atomic)
     position = await pairing_service.add_to_queue_atomic(user_id)
@@ -433,8 +463,9 @@ async def try_pairing(user_id: str):
 
     if not paired:
         # Pairing failed (one user disconnected or already paired)
-        # Put the user who initiated back in queue
+        # Put BOTH users back in queue
         await pairing_service.add_to_queue_atomic(user_id)
+        await pairing_service.add_to_queue_atomic(partner_id)
         logger.warning(f"Atomic pairing failed for {user_id} and {partner_id}")
         return
 
@@ -499,7 +530,7 @@ async def handle_chat_message(user_id: str, data: dict):
             return
 
     # Update activity timestamp
-    manager.update_activity(user_id)
+    await manager.update_activity(user_id)
 
     think = data.get("think", "")
     speech = data.get("speech", "")
@@ -563,47 +594,15 @@ async def handle_reassign(user_id: str):
 
     session = manager.get_session(user_id)
 
-    if session and session.paired:
-        partner_id = session.partner_id
-        session_id = session.session_id
-        is_ai_partner = session.is_ai_partner
-
-        # Handle AI partner differently
-        if is_ai_partner and ai_manager:
-            # Remove AI participant
-            await ai_manager.remove_ai_participant(partner_id)
-            manager.remove_ai_session(partner_id)
-        elif partner_id:
-            # Clear partner's pairing atomically first to prevent race conditions
-            cleared_partner = await manager.clear_pairing_atomic(partner_id)
-
-            # Only proceed if partner still exists
-            if cleared_partner is not None:
-                # Notify human partner
-                await manager.send_json(partner_id, {"type": "partner_left"})
-
-                # Add delay for partner if enabled
-                if ai_manager and ai_manager.pairing_delay_enabled:
-                    pairing_service.add_delay(partner_id)
-
-                # Put partner back in queue (atomic)
-                position = await pairing_service.add_to_queue_atomic(partner_id)
-                await manager.send_json(partner_id, {
-                    "type": "waiting",
-                    "position": position
-                })
-
-                # Schedule delayed pairing for partner
-                if ai_manager and ai_manager.pairing_delay_enabled:
-                    asyncio.create_task(
-                        delayed_pairing(partner_id, ai_manager.reassign_delay_seconds)
-                    )
-                else:
-                    await try_pairing(partner_id)
-
-        # End the conversation
-        if session_id:
-            await storage_service.end_conversation(session_id)
+    if session and session.paired and session.partner_id:
+        # Use helper to clean up partner
+        # schedule_pairing=False: partner waits in queue, will be paired when user is added
+        await handle_partner_breakup(
+            partner_id=session.partner_id,
+            session_id=session.session_id,
+            is_ai_partner=session.is_ai_partner,
+            schedule_pairing=False
+        )
 
     # Clear user's pairing atomically
     await manager.clear_pairing_atomic(user_id)
@@ -634,53 +633,19 @@ async def handle_disconnect(user_id: str):
 
     session = manager.get_session(user_id)
 
-    if session:
-        partner_id = session.partner_id
-        session_id = session.session_id
-        is_ai_partner = session.is_ai_partner
-
-        if partner_id and session.paired:
-            # Handle AI partner differently
-            if is_ai_partner and ai_manager:
-                # Remove AI participant
-                await ai_manager.remove_ai_participant(partner_id)
-                manager.remove_ai_session(partner_id)
-            else:
-                # Clear partner's pairing atomically first to prevent race conditions
-                cleared_partner = await manager.clear_pairing_atomic(partner_id)
-
-                # Only proceed if partner still exists and was successfully cleared
-                if cleared_partner is not None:
-                    # Notify human partner
-                    await manager.send_json(partner_id, {"type": "partner_left"})
-
-                    # Add delay for partner if enabled
-                    if ai_manager and ai_manager.pairing_delay_enabled:
-                        pairing_service.add_delay(partner_id)
-
-                    # Put partner back in queue (atomic)
-                    position = await pairing_service.add_to_queue_atomic(partner_id)
-                    await manager.send_json(partner_id, {
-                        "type": "waiting",
-                        "position": position
-                    })
-
-                    # Schedule delayed pairing for partner
-                    if ai_manager and ai_manager.pairing_delay_enabled:
-                        asyncio.create_task(
-                            delayed_pairing(partner_id, ai_manager.reassign_delay_seconds)
-                        )
-                    else:
-                        await try_pairing(partner_id)
-
-        # End conversation if exists
-        if session_id:
-            await storage_service.end_conversation(session_id)
+    if session and session.paired and session.partner_id:
+        # Use helper to clean up partner
+        await handle_partner_breakup(
+            partner_id=session.partner_id,
+            session_id=session.session_id,
+            is_ai_partner=session.is_ai_partner,
+            schedule_pairing=True
+        )
 
     # Remove from queue and disconnect (atomic)
     await pairing_service.remove_from_queue_atomic(user_id)
     pairing_service.remove_delay(user_id)  # Clean up any pending delay
-    manager.disconnect(user_id)
+    await manager.disconnect(user_id)
 
 
 # ==================== Whisper Transcription API ====================
@@ -857,7 +822,7 @@ async def get_data_file(filename: str, authorized: bool = Depends(verify_admin_p
         raise HTTPException(status_code=404, detail="File not found")
 
     try:
-        with open(filepath, 'r') as f:
+        with open(filepath, 'r', encoding='utf-8') as f:
             content = f.read()
         return {"name": filename, "content": content}
     except Exception as e:
@@ -879,7 +844,7 @@ async def update_data_file(filename: str, file_content: FileContent, authorized:
         # Validate JSON
         json.loads(file_content.content)
 
-        with open(filepath, 'w') as f:
+        with open(filepath, 'w', encoding='utf-8') as f:
             f.write(file_content.content)
 
         # Reload topics/tasks if that file was updated
@@ -972,7 +937,7 @@ async def list_conversations(authorized: bool = Depends(verify_admin_password)):
                 stat = f.stat()
                 # Try to read basic info
                 try:
-                    with open(f, 'r') as file:
+                    with open(f, 'r', encoding='utf-8') as file:
                         data = json.load(file)
                         conversations.append({
                             "session_id": f.stem,
@@ -984,7 +949,7 @@ async def list_conversations(authorized: bool = Depends(verify_admin_password)):
                             "started_at": data.get("started_at"),
                             "ended_at": data.get("ended_at")
                         })
-                except:
+                except Exception:
                     conversations.append({
                         "session_id": f.stem,
                         "filename": f.name,
@@ -1010,7 +975,7 @@ async def get_conversation(session_id: str, authorized: bool = Depends(verify_ad
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     try:
-        with open(filepath, 'r') as f:
+        with open(filepath, 'r', encoding='utf-8') as f:
             content = json.load(f)
         return content
     except Exception as e:

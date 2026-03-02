@@ -31,7 +31,7 @@ class PairingService:
     def _load_topics_tasks(self) -> None:
         """Load topics and tasks from JSON file."""
         try:
-            with open(TOPICS_TASKS_FILE, "r") as f:
+            with open(TOPICS_TASKS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 self._topics = [Topic(**t) for t in data.get("topics", [])]
                 self._tasks = [Task(**t) for t in data.get("tasks", [])]
@@ -103,8 +103,8 @@ class PairingService:
                 break
             checked_users.append(candidate)
 
-        # Put checked users back in queue
-        for u in checked_users:
+        # Put checked users back in queue in same order (reverse before appendleft to maintain order)
+        for u in reversed(checked_users):
             self.queue.appendleft(u)
 
         if partner_id:
